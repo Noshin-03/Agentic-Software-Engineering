@@ -1,176 +1,145 @@
-"""Computes invalid rate, field accuracy, cost and timing per method, with
-spread across the 3 runs, from runs/raw_results.jsonl and
-data/answer_key.json. Writes a report table in the course's standard format.
-"""
-
-from __future__ import annotations
-
 import json
 import re
 import statistics
+import sys
 from pathlib import Path
 
-ROOT = Path(__file__).parent
-SCORED_FIELDS = ("domain", "expires_on")  # schema_version is constant, so excluded
-MAX_TOKENS = 200  # must match the --max-tokens passed to extract.py
-METHOD_LABEL = {"prompt_only": "prompt", "grammar_constrained": "grammar"}
+from jsonschema import Draft202012Validator
 
-REFUSAL_RE = re.compile(
-    r"\b(i cannot|i can't|i'm sorry|i am unable|as an ai)\b", re.IGNORECASE)
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "SQL-Calculation-Agent"))
+from sqlagent.llm import notional_cost  # noqa: E402  (class 1 pricing)
 
-
-def load_rows(path: Path) -> list[dict]:
-    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
-
-
-def field_accuracy(parsed: dict | None, expected: dict) -> float:
-    if not isinstance(parsed, dict):
-        return 0.0
-    correct = sum(1 for f in SCORED_FIELDS if parsed.get(f) == expected.get(f))
-    return correct / len(SCORED_FIELDS)
+HERE = Path(__file__).resolve().parent
+SCHEMA = json.loads((HERE / "schema" / "notice_v1.schema.json").read_text())
+KEY = json.loads((HERE / "data" / "answer_key.json").read_text())
+FIELDS = ["domain", "notice_type", "expires_on", "registrar", "amount_due", "currency",
+          "action_required"]
+VALIDATOR = Draft202012Validator(SCHEMA)
+CACHE_FILE = HERE / "runs" / "prompt_cache.jsonl"  # written by cache_from_logs.py
+CACHED = ({(c["method"], c["run"], c["id"]): c["cached_tokens"]
+           for c in map(json.loads, CACHE_FILE.read_text().splitlines())}
+          if CACHE_FILE.exists() else {})
+FENCE = re.compile(r"^```(?:json)?\s*(.*?)\s*```$", re.DOTALL)
 
 
-def is_fenced(raw: str) -> bool:
-    return raw.strip().startswith("```")
+def parse(raw):
+    """Return (obj or None, fenced?). Only a surrounding ``` fence is forgiven."""
+    text = raw.strip()
+    m = FENCE.match(text)
+    if m:
+        text = m.group(1)
+    try:
+        obj = json.loads(text)
+    except json.JSONDecodeError:
+        return None, bool(m)
+    return obj, bool(m)
 
 
-def is_truncated(row: dict) -> bool:
-    return row["output_tokens"] >= MAX_TOKENS
+def field_equal(name, got, want):
+    if want is None or got is None:
+        return got is None and want is None
+    if name == "amount_due":
+        return (isinstance(got, (int, float)) and not isinstance(got, bool)
+                and abs(got - want) < 0.005)
+    if name == "action_required":
+        return got is want
+    if name == "registrar":
+        norm = lambda s: " ".join(str(s).casefold().split())  # noqa: E731
+        return norm(got) == norm(want)
+    if name == "domain":
+        return str(got).strip().lower() == want
+    return got == want
 
 
-def is_refusal(raw: str) -> bool:
-    return bool(REFUSAL_RE.search(raw))
+def score_record(rec):
+    obj, fenced = parse(rec["raw"])
+    truncated = rec.get("done_reason") == "length"
+    schema_ok = isinstance(obj, dict) and not any(VALIDATOR.iter_errors(obj))
+    valid = schema_ok and not truncated
+    key = KEY[rec["id"]]
+    correct = {f: valid and field_equal(f, obj.get(f), key[f]) for f in FIELDS}
+    return {"id": rec["id"], "valid": valid, "fenced": fenced, "truncated": truncated,
+            "refusal": "{" not in rec["raw"], "parsed": obj is not None,
+            "correct": correct}
 
 
-def mean_minmax(values: list[float]) -> tuple[float, float, float]:
-    return statistics.mean(values), min(values), max(values)
-
-
-def pct(x: float) -> str:
-    return f"{x * 100:.1f}%"
-
-
-def money(x: float) -> str:
-    return f"{x:.4f}"
-
-
-def spread_cell(values: list[float], fmt) -> str:
-    mean, lo, hi = mean_minmax(values)
-    return f"{fmt(mean)} ({fmt(lo)}–{fmt(hi)})"
-
-
-def main() -> None:
-    rows = load_rows(ROOT / "runs" / "raw_results.jsonl")
-    answer_key = json.loads((ROOT / "data" / "answer_key.json").read_text(encoding="utf-8"))
-    methods = sorted({r["method"] for r in rows}, key=lambda m: m != "prompt_only")
-    runs = sorted({r["run"] for r in rows})
-
-    per_method: dict[str, dict] = {}
-    for method in methods:
-        invalid_rates, accs, valid_accs, costs, costs_cached, seconds = [], [], [], [], [], []
-        field_hits = {f: [] for f in SCORED_FIELDS}
-        refusals = truncated = fenced = 0
-
-        for run in runs:
-            run_rows = [r for r in rows if r["method"] == method and r["run"] == run]
-            invalid_rates.append(sum(1 for r in run_rows if not r["valid"]) / len(run_rows))
-            accs.append(statistics.mean(field_accuracy(r["parsed"], answer_key[r["id"]]) for r in run_rows))
-            valid_rows = [r for r in run_rows if r["valid"]]
-            if valid_rows:
-                valid_accs.append(statistics.mean(
-                    field_accuracy(r["parsed"], answer_key[r["id"]]) for r in valid_rows))
-            costs.append(sum(r["cost_usd"] for r in run_rows))
-            seconds.append(sum(r["latency_s"] for r in run_rows))
-            for r in run_rows:
-                refusals += is_refusal(r["raw_output"])
-                truncated += is_truncated(r)
-                fenced += is_fenced(r["raw_output"])
-
-        for f in SCORED_FIELDS:
-            field_hits[f] = statistics.mean(
-                1.0 if r["parsed"] and r["parsed"].get(f) == answer_key[r["id"]].get(f) else 0.0
-                for r in rows if r["method"] == method)
-
-        per_method[method] = dict(
-            invalid_rates=invalid_rates, accs=accs, valid_accs=valid_accs or [0.0],
-            costs=costs, seconds=seconds, refusals=refusals, truncated=truncated,
-            fenced=fenced, field_hits=field_hits,
-        )
-
-    labels = [METHOD_LABEL[m] for m in methods]
-    lines = [
-        "# Notice extraction: prompt-only vs grammar-constrained", "",
-        "No prefix/prompt caching was used (every call runs with `keep_alive=0`, "
-        "per the Class 1 convention of a fresh model state per call), so there is "
-        "no separate \"with prefix cache\" cost/time row here -- all costs below "
-        "already reflect the only mode this experiment ran in.", "",
-        f"| Metric (mean, min–max over {len(runs)} runs) | " + " | ".join(labels) + " |",
-        "|---|" + "---|" * len(methods),
-    ]
-
-    def row(name: str, cells: list[str]) -> str:
-        return f"| {name} | " + " | ".join(cells) + " |"
-
-    lines.append(row("Invalid rate", [spread_cell(per_method[m]["invalid_rates"], pct) for m in methods]))
-    lines.append(row("Field accuracy", [spread_cell(per_method[m]["accs"], pct) for m in methods]))
-    lines.append(row("Field accuracy on valid outputs",
-                      [spread_cell(per_method[m]["valid_accs"], pct) for m in methods]))
-    lines.append(row("Cost per run (USD, notional)", [spread_cell(per_method[m]["costs"], money) for m in methods]))
-    lines.append(row("Total cost, all runs (USD)", [money(sum(per_method[m]["costs"])) for m in methods]))
-    lines.append(row("Seconds per run", [spread_cell(per_method[m]["seconds"], lambda x: f"{x:.0f}") for m in methods]))
-    lines.append(row("Refusals / truncated / fenced (all runs)",
-                      [f"{per_method[m]['refusals']} / {per_method[m]['truncated']} / {per_method[m]['fenced']}"
-                       for m in methods]))
-    for f in SCORED_FIELDS:
-        lines.append(row(f"&nbsp;&nbsp;accuracy: {f}", [pct(per_method[m]["field_hits"][f]) for m in methods]))
-
-    lines.append("")
-    if all(per_method[m]["accs"] == per_method[methods[0]]["accs"] for m in methods):
-        lines.append(
-            "**Note:** prompt-only and grammar-constrained are tied on every metric above "
-            "because the raw model output was byte-identical between the two methods on "
-            "every one of the 150 matched notice/run pairs -- `qwen2.5:3b` at temperature 0 "
-            "never produced malformed JSON under prompt-only instructions, so grammar-"
-            "constrained decoding (which only restricts token *shape*, not *content*) had "
-            "nothing left to fix. See `README.md` for the per-notice error analysis.")
-
-    lines.append("")
-    lines.append("## Field-level errors (run 1, by method)")
-    lines.append("")
-    for method in methods:
-        run1 = [r for r in rows if r["method"] == method and r["run"] == runs[0]]
-        errors = []
-        for r in run1:
-            expected = answer_key[r["id"]]
-            parsed = r["parsed"] or {}
-            for f in SCORED_FIELDS:
-                if parsed.get(f) != expected.get(f):
-                    errors.append(f"- `{r['id']}` **{f}**: got `{parsed.get(f)!r}`, expected `{expected.get(f)!r}`")
-        lines.append(f"### {method} ({len(errors)} field errors out of {len(run1) * len(SCORED_FIELDS)})")
-        lines.extend(errors)
-        lines.append("")
-
-    report_md = "\n".join(lines)
-    (ROOT / "runs" / "report.md").write_text(report_md, encoding="utf-8")
-
-    report_json = {
-        m: {
-            "invalid_rate": per_method[m]["invalid_rates"],
-            "field_accuracy": per_method[m]["accs"],
-            "field_accuracy_valid_only": per_method[m]["valid_accs"],
-            "cost_usd_per_run": per_method[m]["costs"],
-            "total_cost_usd": round(sum(per_method[m]["costs"]), 6),
-            "seconds_per_run": per_method[m]["seconds"],
-            "refusals": per_method[m]["refusals"],
-            "truncated": per_method[m]["truncated"],
-            "fenced": per_method[m]["fenced"],
-            "field_hits": per_method[m]["field_hits"],
-        }
-        for m in methods
+def score_run(path):
+    recs = [json.loads(line) for line in path.read_text().splitlines() if line]
+    scored = [score_record(r) for r in recs]
+    n = len(scored)
+    valid = [s for s in scored if s["valid"]]
+    right = sum(sum(s["correct"].values()) for s in scored)
+    return {
+        "file": path.name, "calls": n,
+        "invalid_rate": 1 - len(valid) / n,
+        "field_accuracy": right / (n * len(FIELDS)),
+        "accuracy_on_valid": (sum(sum(s["correct"].values()) for s in valid)
+                              / (len(valid) * len(FIELDS))) if valid else 0.0,
+        "per_field": {f: sum(s["correct"][f] for s in scored) / n for f in FIELDS},
+        "refusals": sum(s["refusal"] for s in scored),
+        "truncated": sum(s["truncated"] for s in scored),
+        "unparseable": sum(not s["parsed"] for s in scored),
+        "fenced": sum(s["fenced"] for s in scored),
+        "cost_usd": sum(r["cost_usd"] for r in recs),
+        "cost_cached_usd": sum(notional_cost(r["prompt_tokens"], r["completion_tokens"],
+                                             CACHED.get((r["method"], r["run"], r["id"]), 0))
+                               for r in recs),
+        "cached_tokens": sum(CACHED.get((r["method"], r["run"], r["id"]), 0) for r in recs),
+        "prompt_tokens": sum(r["prompt_tokens"] for r in recs),
+        "completion_tokens": sum(r["completion_tokens"] for r in recs),
+        "seconds": sum(r["seconds"] for r in recs),
+        "invalid_ids": [s["id"] for s in scored if not s["valid"]],
     }
-    (ROOT / "runs" / "report.json").write_text(json.dumps(report_json, indent=2) + "\n", encoding="utf-8")
 
-    print(report_md)
+
+def spread(values):
+    return {"mean": statistics.mean(values), "min": min(values), "max": max(values),
+            "runs": values}
+
+
+def main():
+    out = {}
+    for method in ("prompt", "grammar"):
+        runs = [score_run(p) for p in sorted((HERE / "runs").glob(f"{method}_run*.jsonl"))]
+        if not runs:
+            continue
+        out[method] = {
+            "runs": runs,
+            **{m: spread([r[m] for r in runs]) for m in
+               ("invalid_rate", "field_accuracy", "accuracy_on_valid", "cost_usd",
+                "cost_cached_usd", "seconds")},
+            "total_cost_usd": sum(r["cost_usd"] for r in runs),
+            "total_cost_cached_usd": sum(r["cost_cached_usd"] for r in runs),
+            "per_field_mean": {f: statistics.mean(r["per_field"][f] for r in runs)
+                               for f in FIELDS},
+        }
+    (HERE / "results").mkdir(exist_ok=True)
+    (HERE / "results" / "summary.json").write_text(json.dumps(out, indent=2) + "\n")
+
+    pct = lambda s: f"{s['mean']:.1%} ({s['min']:.1%}–{s['max']:.1%})"  # noqa: E731
+    lines = ["| Metric (mean, min–max over runs) | " + " | ".join(out) + " |",
+             "|---|" + "---|" * len(out)]
+    rows = [("Invalid rate", lambda m: pct(m["invalid_rate"])),
+            ("Field accuracy", lambda m: pct(m["field_accuracy"])),
+            ("Field accuracy on valid outputs", lambda m: pct(m["accuracy_on_valid"])),
+            ("Cost per run (USD, notional)", lambda m: "{mean:.4f} ({min:.4f}–{max:.4f})"
+             .format(**m["cost_usd"])),
+            ("Total cost, all runs (USD)", lambda m: f"{m['total_cost_usd']:.4f}"),
+            ("Cost per run with prefix cache (USD)", lambda m: "{mean:.4f} ({min:.4f}–{max:.4f})"
+             .format(**m["cost_cached_usd"])),
+            ("Total cost with prefix cache (USD)",
+             lambda m: f"{m['total_cost_cached_usd']:.4f}"),
+            ("Seconds per run", lambda m: "{mean:.0f} ({min:.0f}–{max:.0f})"
+             .format(**m["seconds"])),
+            ("Refusals / truncated / fenced (all runs)", lambda m: "{} / {} / {}".format(
+                sum(r["refusals"] for r in m["runs"]), sum(r["truncated"] for r in m["runs"]),
+                sum(r["fenced"] for r in m["runs"])))]
+    rows += [(f"  accuracy: {f}", lambda m, f=f: f"{m['per_field_mean'][f]:.1%}") for f in FIELDS]
+    for label, fn in rows:
+        lines.append(f"| {label} | " + " | ".join(fn(m) for m in out.values()) + " |")
+    table = "\n".join(lines)
+    (HERE / "results" / "summary.md").write_text(table + "\n")
+    print(table)
 
 
 if __name__ == "__main__":
